@@ -8,6 +8,7 @@ const char* serverUrl = "http://SEU_IP_AQUI:3000/alerta"; // Use o IP do seu Pop
 const char* mqttBroker = "test.mosquitto.org";
 const int mqttPort = 1883;
 const char* mqttTopicAlert = "recifelabs/sensor-gas/alerta";
+const char* mqttTopicLedState = "recifelabs/sensor-gas/led/state";
 
 const int MQ2_PIN = 34;    // A0 do sensor
 const int BUZZER_PIN = 13; // Sirene
@@ -22,6 +23,8 @@ unsigned long ledAlertStartMs = 0;
 const unsigned long LED_ALERT_DURATION_MS = 10000;
 const unsigned long LED_ALERT_ON_MS = 166;
 const unsigned long LED_ALERT_OFF_MS = 167;
+bool ledForcedMode = false;
+bool ledForcedState = false;
 
 void mqttCallback(char* topic, byte* payload, unsigned int length);
 void reconnectMqtt();
@@ -60,7 +63,11 @@ void loop() {
   }
 
   mqttClient.loop();
-  updateLedAlertPattern();
+  if (!ledForcedMode) {
+    updateLedAlertPattern();
+  } else {
+    digitalWrite(LED_PIN, ledForcedState ? HIGH : LOW);
+  }
 
   int leitura = 0;
   for(int i=0; i<10; i++) { leitura += analogRead(MQ2_PIN); delay(10); }
@@ -70,7 +77,9 @@ void loop() {
 
   if (nivelGas > THRESHOLD) {
     Serial.println("⚠️ ALERTA ACIONADO!");
-    startLedAlertPattern();
+    if (!ledForcedMode) {
+      startLedAlertPattern();
+    }
     
     // Enviar para API
     HTTPClient http;
@@ -84,7 +93,9 @@ void loop() {
     for(int j=0; j<20; j++) {
       digitalWrite(BUZZER_PIN, HIGH); delay(200);
       digitalWrite(BUZZER_PIN, LOW); delay(300);
-      updateLedAlertPattern();
+      if (!ledForcedMode) {
+        updateLedAlertPattern();
+      }
       mqttClient.loop();
     }
 
@@ -102,7 +113,29 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   Serial.printf("📩 [MQTT] %s -> %s\n", topic, incoming.c_str());
 
   if (String(topic) == mqttTopicAlert && incoming.indexOf("ALERTA_GAS") >= 0) {
-    startLedAlertPattern();
+    if (!ledForcedMode) {
+      startLedAlertPattern();
+    }
+  }
+
+  if (String(topic) == mqttTopicLedState) {
+    if (incoming.indexOf("\"state\":\"on\"") >= 0 || incoming == "on") {
+      ledForcedMode = true;
+      ledForcedState = true;
+      ledAlertActive = false;
+      digitalWrite(LED_PIN, HIGH);
+      Serial.println("💡 [LED] Estado forçado ON por tópico");
+    } else if (incoming.indexOf("\"state\":\"off\"") >= 0 || incoming == "off") {
+      ledForcedMode = true;
+      ledForcedState = false;
+      ledAlertActive = false;
+      digitalWrite(LED_PIN, LOW);
+      Serial.println("💡 [LED] Estado forçado OFF por tópico");
+    } else if (incoming.indexOf("\"state\":\"auto\"") >= 0 || incoming == "auto") {
+      ledForcedMode = false;
+      digitalWrite(LED_PIN, LOW);
+      Serial.println("💡 [LED] Modo automático restaurado");
+    }
   }
 }
 
@@ -113,7 +146,9 @@ void reconnectMqtt() {
     if (mqttClient.connect(clientId.c_str())) {
       Serial.println("conectado");
       mqttClient.subscribe(mqttTopicAlert);
+      mqttClient.subscribe(mqttTopicLedState);
       Serial.printf("📡 [MQTT] Inscrito em %s\n", mqttTopicAlert);
+      Serial.printf("💡 [MQTT] Inscrito em %s\n", mqttTopicLedState);
     } else {
       Serial.printf("falha rc=%d. Tentando em 3s\n", mqttClient.state());
       delay(3000);

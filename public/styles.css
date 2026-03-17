@@ -1,0 +1,98 @@
+:root {
+  --bg: #05070a;
+  --primary: #38bdf8;
+  --secondary: #7c3aed;
+  --text: #f8fafc;
+  --muted: #94a3b8;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-family: Inter, Segoe UI, Roboto, Arial, sans-serif;
+  background: radial-gradient(circle at 20% 20%, rgba(56, 189, 248, 0.18), transparent 35%),
+              radial-gradient(circle at 80% 80%, rgba(124, 58, 237, 0.2), transparent 35%),
+              var(--bg);
+  color: var(--text);
+}
+
+.shell {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  position: relative;
+  overflow: hidden;
+}
+
+.grid {
+  position: absolute;
+  inset: 0;
+  background-image: linear-gradient(rgba(56, 189, 248, 0.1) 1px, transparent 1px),
+                    linear-gradient(90deg, rgba(56, 189, 248, 0.1) 1px, transparent 1px);
+  background-size: 38px 38px;
+  mask-image: radial-gradient(circle at center, black, transparent 75%);
+}
+
+.panel {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1rem;
+  padding: 2.2rem;
+  border: 1px solid rgba(56, 189, 248, 0.35);
+  border-radius: 20px;
+  background: rgba(5, 7, 10, 0.78);
+  box-shadow: 0 0 35px rgba(56, 189, 248, 0.16), inset 0 0 0 1px rgba(124, 58, 237, 0.28);
+}
+
+.tag {
+  margin: 0;
+  letter-spacing: 0.16em;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.tech-btn {
+  min-width: 320px;
+  padding: 1rem 1.6rem;
+  border: 0;
+  border-radius: 14px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  color: var(--text);
+  background: linear-gradient(135deg, var(--primary), var(--secondary));
+  cursor: pointer;
+  transition: transform 0.16s ease, box-shadow 0.16s ease, filter 0.16s ease;
+  box-shadow: 0 12px 28px rgba(56, 189, 248, 0.25);
+}
+
+.tech-btn:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 16px 32px rgba(124, 58, 237, 0.3);
+  filter: brightness(1.05);
+}
+
+.tech-btn:active {
+  transform: translateY(0);
+}
+
+.status {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+  text-align: center;
+}
+
+.status.ok {
+  color: #4ade80;
+}
+
+.status.err {
+  color: #ef4444;
+}

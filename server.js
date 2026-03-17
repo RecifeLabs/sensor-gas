@@ -8,12 +8,16 @@ const mqtt = require('mqtt');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const CONTACTS_PATH = path.join(__dirname, 'contatos.json');
+const WEB_DIR = path.join(__dirname, 'public');
 const GAS_THRESHOLD = Number(process.env.GAS_THRESHOLD || 1100);
 const CONTROL_MUTE_MINUTES = Number(process.env.CONTROL_MUTE_MINUTES || 30);
 const MQTT_BROKER_URL = process.env.MQTT_BROKER_URL || 'mqtt://test.mosquitto.org:1883';
 const MQTT_TOPIC_ALERT = process.env.MQTT_TOPIC_ALERT || 'recifelabs/sensor-gas/alerta';
+const MQTT_TOPIC_LED_STATE = process.env.MQTT_TOPIC_LED_STATE || 'recifelabs/sensor-gas/led/state';
+const LED_ALERT_ON_SECONDS = Number(process.env.LED_ALERT_ON_SECONDS || 10);
 
 app.use(express.json());
+app.use(express.static(WEB_DIR));
 
 const mqttClient = mqtt.connect(MQTT_BROKER_URL, {
     reconnectPeriod: 3000,
@@ -22,10 +26,60 @@ const mqttClient = mqtt.connect(MQTT_BROKER_URL, {
 
 let mqttConnected = false;
 const controlledAlerts = new Map();
+let ledAutoOffTimer = null;
+const ledState = {
+    state: 'off',
+    source: 'init',
+    updatedAt: new Date().toISOString(),
+};
+
+function normalizeLedState(value) {
+    if (typeof value !== 'string') {
+        return null;
+    }
+
+    const normalized = value.toLowerCase();
+    if (normalized === 'on' || normalized === 'off') {
+        return normalized;
+    }
+
+    return null;
+}
+
+function updateLedStateCache(state, source = 'unknown') {
+    ledState.state = state;
+    ledState.source = source;
+    ledState.updatedAt = new Date().toISOString();
+}
+
+function publishLedState(state, source = 'server', extra = {}) {
+    if (!mqttConnected) {
+        return false;
+    }
+
+    const normalized = normalizeLedState(state);
+    if (!normalized) {
+        return false;
+    }
+
+    const payload = JSON.stringify({
+        state: normalized,
+        source,
+        updatedAt: new Date().toISOString(),
+        ...extra,
+    });
+
+    mqttClient.publish(MQTT_TOPIC_LED_STATE, payload, { qos: 0, retain: false });
+    updateLedStateCache(normalized, source);
+    console.log(`💡 [MQTT] LED => ${normalized.toUpperCase()} (${source})`);
+    return true;
+}
 
 mqttClient.on('connect', () => {
     mqttConnected = true;
     console.log(`✅ [MQTT] Conectado em ${MQTT_BROKER_URL}`);
+    mqttClient.subscribe(MQTT_TOPIC_LED_STATE, { qos: 0 });
+    console.log(`📡 [MQTT] Inscrito em ${MQTT_TOPIC_LED_STATE}`);
 });
 
 mqttClient.on('reconnect', () => {
@@ -39,6 +93,29 @@ mqttClient.on('error', (error) => {
 
 mqttClient.on('close', () => {
     mqttConnected = false;
+});
+
+mqttClient.on('message', (topic, payloadBuffer) => {
+    if (topic !== MQTT_TOPIC_LED_STATE) {
+        return;
+    }
+
+    const raw = payloadBuffer.toString('utf8');
+    let parsed = null;
+    try {
+        parsed = JSON.parse(raw);
+    } catch (error) {
+        parsed = { state: raw, source: 'raw' };
+    }
+
+    const nextState = normalizeLedState(parsed.state);
+    if (!nextState) {
+        console.warn(`⚠️ [MQTT] Mensagem de LED inválida: ${raw}`);
+        return;
+    }
+
+    updateLedStateCache(nextState, parsed.source || 'mqtt');
+    console.log(`📩 [MQTT] Estado LED atualizado por tópico: ${nextState.toUpperCase()} (${ledState.source})`);
 });
 
 // Configuração do Transportador SMTP (Brevo)
@@ -121,6 +198,14 @@ app.post('/alerta', async (req, res) => {
             mqttClient.publish(MQTT_TOPIC_ALERT, mqttPayload, { qos: 0, retain: false });
             mqttPublished = true;
             console.log(`💡 [MQTT] Comando de LED publicado em ${MQTT_TOPIC_ALERT}`);
+
+            publishLedState('on', 'server-alerta', { local, valor, reason: 'gas-high' });
+            if (ledAutoOffTimer) {
+                clearTimeout(ledAutoOffTimer);
+            }
+            ledAutoOffTimer = setTimeout(() => {
+                publishLedState('off', 'server-auto-off', { reason: 'timer-expired' });
+            }, LED_ALERT_ON_SECONDS * 1000);
         }
 
         res.status(200).json({ status: 'sucesso', mqttPublished, threshold: GAS_THRESHOLD });
@@ -145,6 +230,7 @@ app.post('/alerta/controlado', (req, res) => {
     });
 
     console.log(`✅ [CONTROLE] ${local} marcado como controlado por ${muteMinutes} minuto(s)`);
+    publishLedState('off', 'controle-manual', { local, reason: 'incidente-controlado' });
     return res.status(200).json({
         status: 'controlado',
         local,
@@ -181,6 +267,32 @@ app.get('/alerta/status', (req, res) => {
     });
 });
 
+app.post('/led/state', (req, res) => {
+    const desiredState = normalizeLedState(req.body?.state);
+    const source = typeof req.body?.source === 'string' ? req.body.source : 'http';
+
+    if (!desiredState) {
+        return res.status(400).json({ error: 'state deve ser on ou off' });
+    }
+
+    if (!mqttConnected) {
+        return res.status(503).json({ error: 'MQTT indisponível no momento' });
+    }
+
+    const published = publishLedState(desiredState, source, {
+        reason: req.body?.reason || 'manual-command',
+    });
+
+    return res.status(published ? 200 : 500).json({
+        ok: published,
+        led: ledState,
+    });
+});
+
+app.get('/led/state', (req, res) => {
+    return res.status(200).json({ led: ledState });
+});
+
 app.get('/health', (req, res) => {
     res.status(200).json({
         status: 'ok',
@@ -190,6 +302,12 @@ app.get('/health', (req, res) => {
             broker: MQTT_BROKER_URL,
             topic: MQTT_TOPIC_ALERT,
         },
+        led: {
+            topic: MQTT_TOPIC_LED_STATE,
+            state: ledState.state,
+            source: ledState.source,
+            updatedAt: ledState.updatedAt,
+        },
         threshold: GAS_THRESHOLD,
     });
 });
@@ -198,4 +316,5 @@ app.listen(PORT, () => {
     console.log(`🚀 Servidor Recife Labs em http://localhost:${PORT}`);
     if(!process.env.CHAVE_SMTP_BREVO) console.warn("⚠️ AVISO: Variável CHAVE_SMTP_BREVO não definida no .env");
     console.log(`📡 [MQTT] Topic de alerta: ${MQTT_TOPIC_ALERT}`);
+    console.log(`💡 [MQTT] Topic de estado LED: ${MQTT_TOPIC_LED_STATE}`);
 });
