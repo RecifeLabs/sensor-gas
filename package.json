@@ -1,0 +1,9 @@
+{
+  "dependencies": {
+    "@getbrevo/brevo": "^5.0.1",
+    "dotenv": "^16.6.1",
+    "express": "^5.2.1",
+    "fs": "^0.0.1-security",
+    "nodemailer": "^8.0.2"
+  }
+}
