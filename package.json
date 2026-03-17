@@ -4,6 +4,7 @@
     "dotenv": "^16.6.1",
     "express": "^5.2.1",
     "fs": "^0.0.1-security",
+    "mqtt": "^5.15.0",
     "nodemailer": "^8.0.2"
   }
 }
