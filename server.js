@@ -14,6 +14,7 @@ const CONTROL_MUTE_MINUTES = Number(process.env.CONTROL_MUTE_MINUTES || 30);
 const MQTT_BROKER_URL = process.env.MQTT_BROKER_URL || 'mqtt://test.mosquitto.org:1883';
 const MQTT_TOPIC_ALERT = process.env.MQTT_TOPIC_ALERT || 'recifelabs/sensor-gas/alerta';
 const MQTT_TOPIC_LED_STATE = process.env.MQTT_TOPIC_LED_STATE || 'recifelabs/sensor-gas/led/state';
+const MQTT_TOPIC_BUZZER_TEST = process.env.MQTT_TOPIC_BUZZER_TEST || 'recifelabs/sensor-gas/buzzer/test';
 const LED_ALERT_ON_SECONDS = Number(process.env.LED_ALERT_ON_SECONDS || 10);
 
 app.use(express.json());
@@ -143,6 +144,8 @@ app.use((req, res, next) => {
 app.post('/alerta', async (req, res) => {
     const local = typeof req.body?.local === 'string' ? req.body.local : 'Local não informado';
     const valor = Number(req.body?.valor);
+    const baseline = Number(req.body?.baseline);
+    const razao = typeof req.body?.razao === 'string' ? req.body.razao : '';
 
     if (!Number.isFinite(valor) || valor < 0) {
         return res.status(400).json({ error: 'Campo valor inválido' });
@@ -169,13 +172,19 @@ app.post('/alerta', async (req, res) => {
         if (!fs.existsSync(CONTACTS_PATH)) throw new Error('contatos.json não encontrado');
         const config = JSON.parse(fs.readFileSync(CONTACTS_PATH, 'utf8'));
 
-        console.log(`[DADO] Local: ${local} | Nível: ${valor}`);
+        console.log(`[DADO] Local: ${local} | Nível: ${valor} ppm${Number.isFinite(baseline) ? ` | Baseline: ${baseline} ppm` : ''}`);
+        if (razao) {
+            console.log(`       Razão: ${razao}`);
+        }
+
+        const baselineInfo = Number.isFinite(baseline) ? `<p>Baseline detectada: <b>${baseline} ppm</b></p>` : '';
+        const razaoInfo = razao ? `<p>Motivo: ${razao}</p>` : '';
 
         const mailOptions = {
             from: 'Recife Labs Monitor <alerta@recifelabs.com>',
             to: config.destinatarios.join(', '),
             subject: `⚠️ URGENTE: Vazamento de Gás - ${config.escola}`,
-            html: `<h2>Alerta de Segurança</h2><p>O sensor em <b>${local}</b> detectou nível <b>${valor}</b>.</p>`
+            html: `<h2>🚨 Alerta Crítico de Segurança GLP</h2><p>O sensor em <b>${local}</b> detectou vazamento de gás.</p><p>Nível: <b>${valor} ppm</b></p>${baselineInfo}${razaoInfo}<p style="color:red"><b>AÇÃO IMEDIATA NECESSÁRIA!</b></p>`
         };
 
         await transporter.sendMail(mailOptions);
@@ -187,6 +196,8 @@ app.post('/alerta', async (req, res) => {
                 type: 'ALERTA_GAS',
                 local,
                 valor,
+                baseline: Number.isFinite(baseline) ? baseline : null,
+                razao: razao || null,
                 threshold: GAS_THRESHOLD,
                 led: {
                     blinkPerSecond: 3,
@@ -289,6 +300,31 @@ app.post('/led/state', (req, res) => {
     });
 });
 
+app.post('/buzzer/test', (req, res) => {
+    const durationMs = Number(req.body?.durationMs || 3000);
+
+    if (!mqttConnected) {
+        return res.status(503).json({ error: 'MQTT indisponível no momento' });
+    }
+
+    const safeDuration = Math.min(Math.max(durationMs, 500), 15000);
+    const payload = JSON.stringify({
+        type: 'BUZZER_TEST',
+        durationMs: safeDuration,
+        source: typeof req.body?.source === 'string' ? req.body.source : 'http',
+        timestamp: new Date().toISOString(),
+    });
+
+    mqttClient.publish(MQTT_TOPIC_BUZZER_TEST, payload, { qos: 0, retain: false });
+    console.log(`🔊 [MQTT] Teste de buzzer publicado em ${MQTT_TOPIC_BUZZER_TEST} (${safeDuration}ms)`);
+
+    return res.status(200).json({
+        ok: true,
+        topic: MQTT_TOPIC_BUZZER_TEST,
+        durationMs: safeDuration,
+    });
+});
+
 app.get('/led/state', (req, res) => {
     return res.status(200).json({ led: ledState });
 });
@@ -308,6 +344,9 @@ app.get('/health', (req, res) => {
             source: ledState.source,
             updatedAt: ledState.updatedAt,
         },
+        buzzer: {
+            topic: MQTT_TOPIC_BUZZER_TEST,
+        },
         threshold: GAS_THRESHOLD,
     });
 });
@@ -317,4 +356,5 @@ app.listen(PORT, () => {
     if(!process.env.CHAVE_SMTP_BREVO) console.warn("⚠️ AVISO: Variável CHAVE_SMTP_BREVO não definida no .env");
     console.log(`📡 [MQTT] Topic de alerta: ${MQTT_TOPIC_ALERT}`);
     console.log(`💡 [MQTT] Topic de estado LED: ${MQTT_TOPIC_LED_STATE}`);
+    console.log(`🔊 [MQTT] Topic de teste buzzer: ${MQTT_TOPIC_BUZZER_TEST}`);
 });
