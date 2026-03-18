@@ -44,6 +44,7 @@ body {
   flex-direction: column;
   align-items: center;
   gap: 1rem;
+  width: min(92vw, 760px);
   padding: 2.2rem;
   border: 1px solid rgba(56, 189, 248, 0.35);
   border-radius: 20px;
@@ -95,4 +96,39 @@ body {
 
 .status.err {
   color: #ef4444;
+}
+
+.sensor-box {
+  width: 100%;
+  margin-top: 0.4rem;
+  border: 1px solid rgba(56, 189, 248, 0.25);
+  border-radius: 12px;
+  padding: 0.8rem;
+  background: rgba(2, 6, 23, 0.45);
+}
+
+.sensor-headline {
+  margin: 0 0 0.5rem;
+  font-size: 0.92rem;
+  color: var(--text);
+}
+
+.sensor-log {
+  max-height: 240px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column-reverse;
+  gap: 0.35rem;
+  font-size: 0.82rem;
+}
+
+.sensor-log-item {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.35;
+}
+
+.sensor-log-item.critical {
+  color: #ef4444;
+  font-weight: 600;
 }

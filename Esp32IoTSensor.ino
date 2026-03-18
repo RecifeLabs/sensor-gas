@@ -11,14 +11,16 @@ const int mqttPort = 1883;
 const char* mqttTopicAlert = "recifelabs/sensor-gas/alerta";
 const char* mqttTopicLedState = "recifelabs/sensor-gas/led/state";
 const char* mqttTopicBuzzerTest = "recifelabs/sensor-gas/buzzer/test";
+const char* mqttTopicSensorStatus = "recifelabs/sensor-gas/sensor/status";
 
 const int MQ2_PIN = 34;    // A0 do sensor
 const int BUZZER_PIN = 25; // Pino de saída para buzzer (GPIO34 não serve: somente entrada)
 const int LED_PIN = 2;     // LED Interno D2
 const int THRESHOLD_ABSOLUTE = 40;    // Threshold absoluto mínimo para segurança GLP (muito baixo para detectar vazamentos)
 const int THRESHOLD_RELATIVE = 250;   // Aumento percentual acima da baseline (ex: 250 = 2.5x)
-const unsigned long ALERT_COOLDOWN_MS = 30000;
-const unsigned long SENSOR_READ_INTERVAL_MS = 2000;
+const unsigned long SENSOR_READ_INTERVAL_MS = 250;
+const unsigned long TELEMETRY_PUBLISH_INTERVAL_MS = 1000;
+const unsigned long API_ALERT_MIN_INTERVAL_MS = 2000;
 const unsigned long CALIBRATION_TIME_MS = 30000; // 30 segundos para calibração de baseline
 const bool BUZZER_IS_PASSIVE = false; // false=ativo, true=passivo
 const int BUZZER_TONE_HZ = 2200;
@@ -44,6 +46,8 @@ const unsigned long BUZZER_ALERT_OFF_MS = 300;
 
 unsigned long lastAlertMs = 0;
 unsigned long lastSensorReadMs = 0;
+unsigned long lastTelemetryPublishMs = 0;
+unsigned long lastApiAlertMs = 0;
 unsigned long calibrationStartMs = 0;
 bool isCalibrated = false;
 int baselineGasLevel = 0;
@@ -55,6 +59,8 @@ void startLedAlertPattern();
 void updateLedAlertPattern();
 void startBuzzerAlertPattern(unsigned long durationMs = 10000);
 void updateBuzzerAlertPattern();
+void triggerLocalAlert(unsigned long now, int nivelGas, const String& alertReason);
+void publishSensorStatus(unsigned long now, int nivelGas, bool calibrating, bool alertTriggered, int percentageIncrease);
 void buzzerOn();
 void buzzerOff();
 
@@ -113,14 +119,19 @@ void loop() {
 
   const unsigned long now = millis();
   if (now - lastSensorReadMs < SENSOR_READ_INTERVAL_MS) {
-    delay(10);
     return;
   }
   lastSensorReadMs = now;
 
   int leitura = 0;
-  for(int i=0; i<10; i++) { leitura += analogRead(MQ2_PIN); delay(2); }
-  int nivelGas = leitura / 10;
+  for (int i = 0; i < 5; i++) {
+    leitura += analogRead(MQ2_PIN);
+    delay(1);
+  }
+  int nivelGas = leitura / 5;
+
+  const bool absoluteCritical = nivelGas >= THRESHOLD_ABSOLUTE;
+  int percentageIncrease = 0;
 
   // === FASE DE CALIBRAÇÃO (primeiros 30s) ===
   if (!isCalibrated && (now - calibrationStartMs) < CALIBRATION_TIME_MS) {
@@ -129,6 +140,13 @@ void loop() {
     }
     unsigned long remainingMs = CALIBRATION_TIME_MS - (now - calibrationStartMs);
     Serial.printf("📊 [CALIBRAÇÃO] Nível: %d ppm | Máx: %d ppm | Tempo restante: %lus\n", nivelGas, maxBaselineReading, remainingMs / 1000);
+
+    if (absoluteCritical) {
+      String reason = String(nivelGas) + " ppm acima do mínimo absoluto (" + THRESHOLD_ABSOLUTE + " ppm) durante calibração";
+      triggerLocalAlert(now, nivelGas, reason);
+    }
+
+    publishSensorStatus(now, nivelGas, true, absoluteCritical, percentageIncrease);
     return;
   }
 
@@ -145,14 +163,14 @@ void loop() {
   String alertReason = "";
 
   // Critério 1: Threshold absoluto mínimo (segurança)
-  if (nivelGas > THRESHOLD_ABSOLUTE) {
+  if (absoluteCritical) {
     alertTriggered = true;
-    alertReason = String(nivelGas) + " ppm acima do minimum absoluto (" + THRESHOLD_ABSOLUTE + " ppm)";
+    alertReason = String(nivelGas) + " ppm acima do mínimo absoluto (" + THRESHOLD_ABSOLUTE + " ppm)";
   }
 
   // Critério 2: Aumento relativo acima da baseline (detecção de mudanças)
   if (nivelGas > baselineGasLevel) {
-    int percentageIncrease = ((nivelGas - baselineGasLevel) * 1000) / max(baselineGasLevel, 1);
+    percentageIncrease = ((nivelGas - baselineGasLevel) * 1000) / max(baselineGasLevel, 1);
     if (percentageIncrease >= THRESHOLD_RELATIVE) {
       alertTriggered = true;
       alertReason = String(nivelGas) + " ppm = +" + (percentageIncrease / 10) + "% acima do baseline (" + baselineGasLevel + " ppm)";
@@ -163,23 +181,31 @@ void loop() {
     Serial.printf("Nível: %d ppm | Normal (baseline: %d ppm)\n", nivelGas, baselineGasLevel);
   }
 
-  const bool cooldownReady = (now - lastAlertMs) >= ALERT_COOLDOWN_MS;
+  publishSensorStatus(now, nivelGas, false, alertTriggered, percentageIncrease);
 
-  if (alertTriggered && cooldownReady) {
-    Serial.println("\n🚨 ALERTA ACIONADO! PERIGO DE VAZAMENTO DE GLP!");
-    Serial.printf("   Motivo: %s\n\n", alertReason.c_str());
+  if (alertTriggered) {
+    triggerLocalAlert(now, nivelGas, alertReason);
+  }
+}
 
-    // Alerta local sempre tem prioridade (mesmo se LED tiver sido forçado por MQTT)
-    if (ledForcedMode) {
-      ledForcedMode = false;
-      Serial.println("💡 [LED] Override local: saindo de modo forçado para alerta de gás");
-    }
+void triggerLocalAlert(unsigned long now, int nivelGas, const String& alertReason) {
+  Serial.println("\n🚨 ALERTA ACIONADO! PERIGO DE VAZAMENTO DE GLP!");
+  Serial.printf("   Motivo: %s\n\n", alertReason.c_str());
 
+  if (ledForcedMode) {
+    ledForcedMode = false;
+    Serial.println("💡 [LED] Override local: saindo de modo forçado para alerta de gás");
+  }
+
+  if (!ledAlertActive) {
     startLedAlertPattern();
+  }
+  if (!buzzerAlertActive) {
     startBuzzerAlertPattern(10000);
-    lastAlertMs = now;
-    
-    // Enviar para API
+  }
+  lastAlertMs = now;
+
+  if ((now - lastApiAlertMs) >= API_ALERT_MIN_INTERVAL_MS) {
     HTTPClient http;
     http.begin(serverUrl);
     http.addHeader("Content-Type", "application/json");
@@ -187,7 +213,33 @@ void loop() {
     int httpResponseCode = http.POST(payload);
     Serial.printf("📤 API status: %d\n", httpResponseCode);
     http.end();
+    lastApiAlertMs = now;
   }
+}
+
+void publishSensorStatus(unsigned long now, int nivelGas, bool calibrating, bool alertTriggered, int percentageIncrease) {
+  if (!mqttClient.connected()) {
+    return;
+  }
+
+  if (!alertTriggered && (now - lastTelemetryPublishMs) < TELEMETRY_PUBLISH_INTERVAL_MS) {
+    return;
+  }
+
+  lastTelemetryPublishMs = now;
+  String payload = "{";
+  payload += "\"local\":\"Cozinha Escola\",";
+  payload += "\"nivel\":" + String(nivelGas) + ",";
+  payload += "\"baseline\":" + String(baselineGasLevel) + ",";
+  payload += "\"calibrating\":" + String(calibrating ? "true" : "false") + ",";
+  payload += "\"critical\":" + String(alertTriggered ? "true" : "false") + ",";
+  payload += "\"increasePermille\":" + String(percentageIncrease) + ",";
+  payload += "\"thresholdAbsolute\":" + String(THRESHOLD_ABSOLUTE) + ",";
+  payload += "\"thresholdRelative\":" + String(THRESHOLD_RELATIVE) + ",";
+  payload += "\"timestampMs\":" + String(now);
+  payload += "}";
+
+  mqttClient.publish(mqttTopicSensorStatus, payload.c_str(), false);
 }
 
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
@@ -264,6 +316,7 @@ void reconnectMqtt() {
       Serial.printf("📡 [MQTT] Inscrito em %s\n", mqttTopicAlert);
       Serial.printf("💡 [MQTT] Inscrito em %s\n", mqttTopicLedState);
       Serial.printf("🔊 [MQTT] Inscrito em %s\n", mqttTopicBuzzerTest);
+      Serial.printf("📈 [MQTT] Publicando em %s\n", mqttTopicSensorStatus);
     } else {
       Serial.printf("falha rc=%d. Tentando em 3s\n", mqttClient.state());
       delay(3000);

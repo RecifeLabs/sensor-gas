@@ -15,6 +15,7 @@ const MQTT_BROKER_URL = process.env.MQTT_BROKER_URL || 'mqtt://test.mosquitto.or
 const MQTT_TOPIC_ALERT = process.env.MQTT_TOPIC_ALERT || 'recifelabs/sensor-gas/alerta';
 const MQTT_TOPIC_LED_STATE = process.env.MQTT_TOPIC_LED_STATE || 'recifelabs/sensor-gas/led/state';
 const MQTT_TOPIC_BUZZER_TEST = process.env.MQTT_TOPIC_BUZZER_TEST || 'recifelabs/sensor-gas/buzzer/test';
+const MQTT_TOPIC_SENSOR_STATUS = process.env.MQTT_TOPIC_SENSOR_STATUS || 'recifelabs/sensor-gas/sensor/status';
 const LED_ALERT_ON_SECONDS = Number(process.env.LED_ALERT_ON_SECONDS || 10);
 
 app.use(express.json());
@@ -33,6 +34,21 @@ const ledState = {
     source: 'init',
     updatedAt: new Date().toISOString(),
 };
+const sensorState = {
+    local: 'Cozinha Escola',
+    nivel: null,
+    baseline: null,
+    calibrating: true,
+    critical: false,
+    increasePermille: 0,
+    thresholdAbsolute: null,
+    thresholdRelative: null,
+    source: 'init',
+    updatedAt: new Date().toISOString(),
+};
+const sensorLogs = [];
+const SENSOR_LOG_LIMIT = 120;
+const sseClients = new Set();
 
 function normalizeLedState(value) {
     if (typeof value !== 'string') {
@@ -76,11 +92,40 @@ function publishLedState(state, source = 'server', extra = {}) {
     return true;
 }
 
+function broadcastSse(event, data) {
+    const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+    for (const client of sseClients) {
+        client.write(payload);
+    }
+}
+
+function addSensorLog(entry) {
+    sensorLogs.push(entry);
+    if (sensorLogs.length > SENSOR_LOG_LIMIT) {
+        sensorLogs.shift();
+    }
+}
+
+function updateSensorState(partial, source = 'unknown') {
+    Object.assign(sensorState, partial, {
+        source,
+        updatedAt: new Date().toISOString(),
+    });
+
+    const logEntry = {
+        ...sensorState,
+    };
+    addSensorLog(logEntry);
+    broadcastSse('sensor', logEntry);
+}
+
 mqttClient.on('connect', () => {
     mqttConnected = true;
     console.log(`✅ [MQTT] Conectado em ${MQTT_BROKER_URL}`);
     mqttClient.subscribe(MQTT_TOPIC_LED_STATE, { qos: 0 });
     console.log(`📡 [MQTT] Inscrito em ${MQTT_TOPIC_LED_STATE}`);
+    mqttClient.subscribe(MQTT_TOPIC_SENSOR_STATUS, { qos: 0 });
+    console.log(`📈 [MQTT] Inscrito em ${MQTT_TOPIC_SENSOR_STATUS}`);
 });
 
 mqttClient.on('reconnect', () => {
@@ -97,16 +142,40 @@ mqttClient.on('close', () => {
 });
 
 mqttClient.on('message', (topic, payloadBuffer) => {
-    if (topic !== MQTT_TOPIC_LED_STATE) {
-        return;
-    }
-
     const raw = payloadBuffer.toString('utf8');
     let parsed = null;
     try {
         parsed = JSON.parse(raw);
     } catch (error) {
-        parsed = { state: raw, source: 'raw' };
+        parsed = { raw, source: 'raw' };
+    }
+
+    if (topic === MQTT_TOPIC_SENSOR_STATUS) {
+        const nivel = Number(parsed?.nivel);
+        const baseline = Number(parsed?.baseline);
+        const increasePermille = Number(parsed?.increasePermille);
+
+        if (!Number.isFinite(nivel)) {
+            console.warn(`⚠️ [MQTT] Status de sensor inválido: ${raw}`);
+            return;
+        }
+
+        updateSensorState({
+            local: typeof parsed?.local === 'string' ? parsed.local : sensorState.local,
+            nivel,
+            baseline: Number.isFinite(baseline) ? baseline : sensorState.baseline,
+            calibrating: Boolean(parsed?.calibrating),
+            critical: Boolean(parsed?.critical),
+            increasePermille: Number.isFinite(increasePermille) ? increasePermille : 0,
+            thresholdAbsolute: Number.isFinite(Number(parsed?.thresholdAbsolute)) ? Number(parsed.thresholdAbsolute) : sensorState.thresholdAbsolute,
+            thresholdRelative: Number.isFinite(Number(parsed?.thresholdRelative)) ? Number(parsed.thresholdRelative) : sensorState.thresholdRelative,
+        }, 'mqtt-sensor');
+
+        return;
+    }
+
+    if (topic !== MQTT_TOPIC_LED_STATE) {
+        return;
     }
 
     const nextState = normalizeLedState(parsed.state);
@@ -176,6 +245,21 @@ app.post('/alerta', async (req, res) => {
         if (razao) {
             console.log(`       Razão: ${razao}`);
         }
+
+        updateSensorState({
+            local,
+            nivel: valor,
+            baseline: Number.isFinite(baseline) ? baseline : sensorState.baseline,
+            critical: true,
+            calibrating: false,
+        }, 'http-alerta');
+        broadcastSse('alert', {
+            local,
+            valor,
+            baseline: Number.isFinite(baseline) ? baseline : null,
+            razao,
+            timestamp: new Date().toISOString(),
+        });
 
         const baselineInfo = Number.isFinite(baseline) ? `<p>Baseline detectada: <b>${baseline} ppm</b></p>` : '';
         const razaoInfo = razao ? `<p>Motivo: ${razao}</p>` : '';
@@ -329,6 +413,35 @@ app.get('/led/state', (req, res) => {
     return res.status(200).json({ led: ledState });
 });
 
+app.get('/sensor/status', (req, res) => {
+    return res.status(200).json({
+        sensor: sensorState,
+        logs: sensorLogs,
+    });
+});
+
+app.get('/sensor/stream', (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+
+    sseClients.add(res);
+    res.write(`event: ready\ndata: ${JSON.stringify({
+        sensor: sensorState,
+        logs: sensorLogs,
+    })}\n\n`);
+
+    const heartbeat = setInterval(() => {
+        res.write('event: heartbeat\ndata: {}\n\n');
+    }, 15000);
+
+    req.on('close', () => {
+        clearInterval(heartbeat);
+        sseClients.delete(res);
+    });
+});
+
 app.get('/health', (req, res) => {
     res.status(200).json({
         status: 'ok',
@@ -347,6 +460,11 @@ app.get('/health', (req, res) => {
         buzzer: {
             topic: MQTT_TOPIC_BUZZER_TEST,
         },
+        sensor: {
+            topic: MQTT_TOPIC_SENSOR_STATUS,
+            latest: sensorState,
+            logSize: sensorLogs.length,
+        },
         threshold: GAS_THRESHOLD,
     });
 });
@@ -357,4 +475,5 @@ app.listen(PORT, () => {
     console.log(`📡 [MQTT] Topic de alerta: ${MQTT_TOPIC_ALERT}`);
     console.log(`💡 [MQTT] Topic de estado LED: ${MQTT_TOPIC_LED_STATE}`);
     console.log(`🔊 [MQTT] Topic de teste buzzer: ${MQTT_TOPIC_BUZZER_TEST}`);
+    console.log(`📈 [MQTT] Topic de telemetria: ${MQTT_TOPIC_SENSOR_STATUS}`);
 });
