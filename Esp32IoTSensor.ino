@@ -16,12 +16,13 @@ const char* mqttTopicSensorStatus = "recifelabs/sensor-gas/sensor/status";
 const int MQ2_PIN = 34;    // A0 do sensor
 const int BUZZER_PIN = 25; // Pino de saída para buzzer (GPIO34 não serve: somente entrada)
 const int LED_PIN = 2;     // LED Interno D2
-const int THRESHOLD_ABSOLUTE = 40;    // Threshold absoluto mínimo para segurança GLP (muito baixo para detectar vazamentos)
-const int THRESHOLD_RELATIVE = 250;   // Aumento percentual acima da baseline (ex: 250 = 2.5x)
+const int THRESHOLD_ABSOLUTE = 18;    // Muito sensível para GLP de cozinha (resposta precoce)
+const int THRESHOLD_RELATIVE = 120;   // +120% acima da baseline (mais sensível para vazamento gradual)
+const int THRESHOLD_DELTA = 8;        // Delta mínimo acima da baseline para disparo
 const unsigned long SENSOR_READ_INTERVAL_MS = 250;
 const unsigned long TELEMETRY_PUBLISH_INTERVAL_MS = 1000;
 const unsigned long API_ALERT_MIN_INTERVAL_MS = 2000;
-const unsigned long CALIBRATION_TIME_MS = 30000; // 30 segundos para calibração de baseline
+const unsigned long CALIBRATION_TIME_MS = 10000; // 10 segundos para calibração de baseline
 const bool BUZZER_IS_PASSIVE = false; // false=ativo, true=passivo
 const int BUZZER_TONE_HZ = 2200;
 const int BUZZER_LEDC_CHANNEL = 0;
@@ -52,6 +53,8 @@ unsigned long calibrationStartMs = 0;
 bool isCalibrated = false;
 int baselineGasLevel = 0;
 int maxBaselineReading = 0;
+long baselineAccumulator = 0;
+int baselineSamples = 0;
 
 void mqttCallback(char* topic, byte* payload, unsigned int length);
 void reconnectMqtt();
@@ -61,6 +64,7 @@ void startBuzzerAlertPattern(unsigned long durationMs = 10000);
 void updateBuzzerAlertPattern();
 void triggerLocalAlert(unsigned long now, int nivelGas, const String& alertReason);
 void publishSensorStatus(unsigned long now, int nivelGas, bool calibrating, bool alertTriggered, int percentageIncrease);
+void playCalibrationDonePattern();
 void buzzerOn();
 void buzzerOff();
 
@@ -94,7 +98,7 @@ void setup() {
   }
   Serial.println("\n✅ WiFi Conectado!");
   Serial.println("\n🔧 Iniciando CALIBRAÇÃO de baseline...");
-  Serial.println("⏱️  Aguarde 30 segundos para estabilizar leituras...");
+  Serial.println("⏱️  Aguarde 10 segundos para estabilizar leituras...");
   Serial.printf("📊 Threshold ABSOLUTO: %d ppm | Threshold RELATIVO: %d%% acima da baseline\n", THRESHOLD_ABSOLUTE, (THRESHOLD_RELATIVE / 10));
   calibrationStartMs = millis();
 
@@ -135,6 +139,9 @@ void loop() {
 
   // === FASE DE CALIBRAÇÃO (primeiros 30s) ===
   if (!isCalibrated && (now - calibrationStartMs) < CALIBRATION_TIME_MS) {
+    baselineAccumulator += nivelGas;
+    baselineSamples++;
+
     if (nivelGas > maxBaselineReading) {
       maxBaselineReading = nivelGas;
     }
@@ -152,9 +159,11 @@ void loop() {
 
   // === CALIBRAÇÃO COMPLETA ===
   if (!isCalibrated) {
-    baselineGasLevel = maxBaselineReading;
+    int baselineAverage = baselineSamples > 0 ? (baselineAccumulator / baselineSamples) : maxBaselineReading;
+    baselineGasLevel = max(baselineAverage, 1);
     isCalibrated = true;
-    Serial.printf("\n✅ CALIBRAÇÃO CONCLUÍDA!\n🎯 Baseline de referência: %d ppm\n", baselineGasLevel);
+    Serial.printf("\n✅ CALIBRAÇÃO CONCLUÍDA!\n🎯 Baseline média: %d | Pico: %d\n", baselineGasLevel, maxBaselineReading);
+    playCalibrationDonePattern();
     Serial.println("🚨 Sistema em modo ALERTA SENSÍVEL para GLP\n");
   }
 
@@ -175,6 +184,13 @@ void loop() {
       alertTriggered = true;
       alertReason = String(nivelGas) + " ppm = +" + (percentageIncrease / 10) + "% acima do baseline (" + baselineGasLevel + " ppm)";
     }
+
+    const int delta = nivelGas - baselineGasLevel;
+    if (delta >= THRESHOLD_DELTA) {
+      alertTriggered = true;
+      alertReason = String(nivelGas) + " ppm (delta +" + delta + ") acima da baseline (" + baselineGasLevel + ")";
+    }
+
     Serial.printf("Nível: %d ppm | Baseline: %d ppm | Aumento: %d.%d%% (limite: %d%%)\n", 
                   nivelGas, baselineGasLevel, percentageIncrease / 10, percentageIncrease % 10, THRESHOLD_RELATIVE / 10);
   } else {
@@ -240,6 +256,24 @@ void publishSensorStatus(unsigned long now, int nivelGas, bool calibrating, bool
   payload += "}";
 
   mqttClient.publish(mqttTopicSensorStatus, payload.c_str(), false);
+}
+
+void playCalibrationDonePattern() {
+  Serial.println("🎵 [BUZZER] Calibração finalizada: beeep, beep, bep");
+
+  buzzerOn();
+  delay(450);
+  buzzerOff();
+  delay(130);
+
+  buzzerOn();
+  delay(220);
+  buzzerOff();
+  delay(120);
+
+  buzzerOn();
+  delay(120);
+  buzzerOff();
 }
 
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
